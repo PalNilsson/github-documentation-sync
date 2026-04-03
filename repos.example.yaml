@@ -1,0 +1,41 @@
+logging:
+  level: INFO
+  file: ./logs/github_doc_sync.log
+  format: "%(asctime)s %(levelname)s %(name)s: %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  max_bytes: 5000000
+  backup_count: 3
+
+repos:
+  - name: eic/tutorial-analysis
+    destination: ./data/tutorial-analysis/raw
+    normalized_destination: ./data/tutorial-analysis/normalized
+    within_hours: 24
+    branch: main
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "drafts/*"
+    normalize_for_rag: true
+
+  - name: myorg/docs-repo
+    destination: ./data/docs-repo/raw
+    normalized_destination: ./data/docs-repo/normalized
+    within_hours: 12
+    branch: develop
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "archive/*"
+    normalize_for_rag: true
+
+  - name: another/repo
+    destination: ./data/another/raw
+    normalized_destination: ./data/another/normalized
+    within_hours: 24
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    normalize_for_rag: true
