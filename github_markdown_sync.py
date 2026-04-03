@@ -1,40 +1,27 @@
-"""Utilities for syncing and normalizing documentation from GitHub.
-
-The sync process:
-  1. Checks whether a repository has changed recently.
-  2. Compares recursive Git trees by commit SHA.
-  3. Downloads only changed documentation files.
-  4. Writes a normalized RAG-friendly copy for ingestion.
-
-Supported input formats:
-  * Markdown (.md)
-  * reStructuredText (.rst)
-
-The normalized output is a canonical Markdown-like document with a small
-metadata header and consistent whitespace. This is intentionally lightweight
-so it can run in cron jobs without extra external dependencies.
-"""
+"""Sync and normalize GitHub documentation."""
 
 from __future__ import annotations
 
 import fnmatch
+import importlib
 import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from urllib.parse import quote
 
 import requests
-
 
 STATE_FILENAME = ".sync_state.json"
 
 
 @dataclass(frozen=True)
 class LoggingConfig:
-    """Logging configuration loaded from YAML."""
+    """Logging settings loaded from YAML."""
 
     level: str = "INFO"
     file: str | None = None
@@ -44,37 +31,31 @@ class LoggingConfig:
     backup_count: int = 3
 
 
+# pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class RepoConfig:
-    """Configuration for one repository to monitor."""
+    """Configuration for one monitored repository."""
 
     name: str
     destination: Path
     normalized_destination: Path | None = None
     within_hours: int = 24
     branch: str | None = None
-    include_patterns: list[str] = field(default_factory=lambda: ["*.md", "*.rst"])
+    include_patterns: list[str] = field(
+        default_factory=lambda: ["*.md", "*.rst"]
+    )
     exclude_patterns: list[str] = field(default_factory=list)
     normalize_for_rag: bool = True
 
     @staticmethod
     def from_dict(data: dict[str, Any], base_dir: Path) -> "RepoConfig":
-        """Create a RepoConfig from a dictionary.
-
-        Args:
-            data: Repo configuration dictionary.
-            base_dir: Base directory used to resolve relative paths.
-
-        Returns:
-            A RepoConfig instance.
-
-        Raises:
-            ValueError: If required keys are missing or invalid.
-        """
+        """Build a repository config from a dictionary."""
         if "name" not in data:
             raise ValueError("Each repo entry must contain a 'name' field.")
         if "destination" not in data:
-            raise ValueError("Each repo entry must contain a 'destination' field.")
+            raise ValueError(
+                "Each repo entry must contain a 'destination' field."
+            )
 
         destination = Path(data["destination"])
         if not destination.is_absolute():
@@ -84,11 +65,12 @@ class RepoConfig:
         if normalized_destination is not None:
             normalized_destination = Path(normalized_destination)
             if not normalized_destination.is_absolute():
-                normalized_destination = (base_dir / normalized_destination).resolve()
+                normalized_destination = (
+                    base_dir / normalized_destination
+                ).resolve()
 
         include_patterns = data.get("include_patterns", ["*.md", "*.rst"])
         exclude_patterns = data.get("exclude_patterns", [])
-
         if isinstance(include_patterns, str):
             include_patterns = [include_patterns]
         if isinstance(exclude_patterns, str):
@@ -100,8 +82,8 @@ class RepoConfig:
             normalized_destination=normalized_destination,
             within_hours=int(data.get("within_hours", 24)),
             branch=data.get("branch"),
-            include_patterns=[str(p) for p in include_patterns],
-            exclude_patterns=[str(p) for p in exclude_patterns],
+            include_patterns=[str(pattern) for pattern in include_patterns],
+            exclude_patterns=[str(pattern) for pattern in exclude_patterns],
             normalize_for_rag=bool(data.get("normalize_for_rag", True)),
         )
 
@@ -115,17 +97,8 @@ class AppConfig:
 
     @staticmethod
     def from_yaml(data: dict[str, Any], config_path: Path) -> "AppConfig":
-        """Create an AppConfig from parsed YAML data.
-
-        Args:
-            data: Parsed YAML dictionary.
-            config_path: Path to the configuration file.
-
-        Returns:
-            An AppConfig instance.
-        """
+        """Build an app config from parsed YAML data."""
         base_dir = config_path.parent.resolve()
-
         logging_cfg = data.get("logging", {}) or {}
         log_cfg = LoggingConfig(
             level=str(logging_cfg.get("level", "INFO")),
@@ -145,7 +118,10 @@ class AppConfig:
         if not isinstance(repos_data, list):
             raise ValueError("'repos' must be a list in the YAML config.")
 
-        repos = [RepoConfig.from_dict(item, base_dir=base_dir) for item in repos_data]
+        repos = [
+            RepoConfig.from_dict(item, base_dir=base_dir)
+            for item in repos_data
+        ]
         return AppConfig(logging=log_cfg, repos=repos)
 
 
@@ -158,9 +134,10 @@ class SyncState:
     files_downloaded: int = 0
 
 
+# pylint: disable=too-many-instance-attributes
 @dataclass(frozen=True)
 class SyncResult:
-    """Summary of a single repository sync run."""
+    """Summary of one sync run."""
 
     repo: str
     latest_commit_sha: str
@@ -172,12 +149,19 @@ class SyncResult:
     reason: str | None = None
 
 
-def configure_logging(config: LoggingConfig) -> None:
-    """Configure root logging for the application.
+@dataclass(frozen=True)
+class RepoContext:
+    """Resolved repository paths and names."""
 
-    Args:
-        config: Logging settings loaded from YAML.
-    """
+    owner: str
+    repo: str
+    repo_name: str
+    destination: Path
+    normalized_destination: Path
+
+
+def configure_logging(config: LoggingConfig) -> None:
+    """Configure root logging."""
     level = getattr(logging, config.level.upper(), logging.INFO)
     root = logging.getLogger()
     root.setLevel(level)
@@ -192,8 +176,6 @@ def configure_logging(config: LoggingConfig) -> None:
     root.addHandler(stream_handler)
 
     if config.file:
-        from logging.handlers import RotatingFileHandler
-
         log_path = Path(config.file).expanduser().resolve()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
@@ -206,25 +188,19 @@ def configure_logging(config: LoggingConfig) -> None:
 
 
 def load_yaml_config(config_path: str | Path) -> AppConfig:
-    """Load an application config from a YAML file.
-
-    Args:
-        config_path: Path to a YAML configuration file.
-
-    Returns:
-        An AppConfig instance.
-    """
-    from yaml import safe_load
-
+    """Load an application config from YAML."""
+    yaml_module = importlib.import_module("yaml")
     path = Path(config_path).expanduser().resolve()
-    data = safe_load(path.read_text(encoding="utf-8")) or {}
+    data = yaml_module.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
-        raise ValueError("YAML config must contain a mapping at the top level.")
+        raise ValueError(
+            "YAML config must contain a mapping at the top level."
+        )
     return AppConfig.from_yaml(data, config_path=path)
 
 
 def github_headers(token: str | None = None) -> dict[str, str]:
-    """Return standard GitHub API headers."""
+    """Build standard GitHub API headers."""
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "github-doc-sync",
@@ -235,7 +211,7 @@ def github_headers(token: str | None = None) -> dict[str, str]:
 
 
 def parse_repo(repo_arg: str) -> tuple[str, str]:
-    """Parse repository string in owner/repo format."""
+    """Parse owner/repo."""
     if "/" not in repo_arg:
         raise ValueError("Repository must be in the form owner/repo")
     owner, repo = repo_arg.split("/", 1)
@@ -245,32 +221,26 @@ def parse_repo(repo_arg: str) -> tuple[str, str]:
 
 
 def state_file_path(destination: Path) -> Path:
-    """Return the sync state file path."""
+    """Return the JSON state path."""
     return destination / STATE_FILENAME
 
 
 def load_state(destination: Path) -> SyncState:
-    """Load sync state from disk.
-
-    Args:
-        destination: Destination directory.
-
-    Returns:
-        The parsed sync state, or an empty state if missing/corrupt.
-    """
+    """Load sync state from disk."""
     path = state_file_path(destination)
     if not path.exists():
         return SyncState()
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return SyncState(
-            last_commit_sha=data.get("last_commit_sha"),
-            last_sync_time=data.get("last_sync_time"),
-            files_downloaded=int(data.get("files_downloaded", 0)),
-        )
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return SyncState()
+
+    return SyncState(
+        last_commit_sha=data.get("last_commit_sha"),
+        last_sync_time=data.get("last_sync_time"),
+        files_downloaded=int(data.get("files_downloaded", 0)),
+    )
 
 
 def save_state(destination: Path, state: SyncState) -> None:
@@ -288,7 +258,7 @@ def get_latest_commit(
     token: str | None = None,
     branch: str | None = None,
 ) -> tuple[str, datetime]:
-    """Get the latest commit SHA and timestamp."""
+    """Return the latest commit SHA and time."""
     headers = github_headers(token)
     with requests.Session() as session:
         if branch is None:
@@ -311,16 +281,17 @@ def get_latest_commit(
         raise RuntimeError("No commits found in repository.")
 
     commit = commits[0]
-    sha = commit["sha"]
     commit_time = datetime.fromisoformat(
         commit["commit"]["committer"]["date"].replace("Z", "+00:00")
     )
-    return sha, commit_time
+    return commit["sha"], commit_time
 
 
 def was_recent(commit_time: datetime, within_hours: int) -> bool:
-    """Return whether a timestamp is within the requested age."""
-    return (datetime.now(timezone.utc) - commit_time) <= timedelta(hours=within_hours)
+    """Return True if the commit time is recent enough."""
+    return (
+        datetime.now(timezone.utc) - commit_time
+    ) <= timedelta(hours=within_hours)
 
 
 def get_recursive_tree(
@@ -342,7 +313,9 @@ def get_recursive_tree(
         data = response.json()
 
     if data.get("truncated"):
-        raise RuntimeError("Git tree response was truncated; repository may be too large.")
+        raise RuntimeError(
+            "Git tree response was truncated; repository may be too large."
+        )
 
     tree: dict[str, str] = {}
     for item in data.get("tree", []):
@@ -351,10 +324,18 @@ def get_recursive_tree(
     return tree
 
 
-def path_matches(path: str, include_patterns: list[str], exclude_patterns: list[str]) -> bool:
-    """Check whether a path matches include/exclude patterns."""
-    included = any(fnmatch.fnmatch(path, pattern) for pattern in include_patterns)
-    excluded = any(fnmatch.fnmatch(path, pattern) for pattern in exclude_patterns)
+def path_matches(
+    path: str,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+) -> bool:
+    """Check whether a path matches include and exclude patterns."""
+    included = any(
+        fnmatch.fnmatch(path, pattern) for pattern in include_patterns
+    )
+    excluded = any(
+        fnmatch.fnmatch(path, pattern) for pattern in exclude_patterns
+    )
     return included and not excluded
 
 
@@ -377,19 +358,7 @@ def normalize_document(
     repo_name: str,
     commit_sha: str,
 ) -> str:
-    """Normalize a source document into a canonical Markdown-like format.
-
-    The output contains a small metadata header followed by cleaned content.
-
-    Args:
-        content: Raw file contents.
-        source_path: Repository-relative path.
-        repo_name: Repository in owner/repo format.
-        commit_sha: Commit SHA used for the download.
-
-    Returns:
-        Canonical text suitable for RAG ingestion.
-    """
+    """Normalize a source document into a canonical text form."""
     suffix = Path(source_path).suffix.lower()
     if suffix == ".rst":
         body = normalize_rst_to_markdown(content)
@@ -411,16 +380,15 @@ def normalize_document(
 
 
 def normalize_markdown(content: str) -> str:
-    """Normalize Markdown content with conservative cleanup."""
+    """Normalize Markdown content conservatively."""
     text = content.replace("\r\n", "\n").replace("\r", "\n")
     text = text.lstrip("\ufeff")
 
-    # Strip a simple YAML front matter block if present.
     lines = text.split("\n")
     if len(lines) >= 3 and lines[0].strip() == "---":
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "---":
-                text = "\n".join(lines[i + 1 :])
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                text = "\n".join(lines[index + 1:])
                 break
 
     text = re.sub(r"[ \t]+\n", "\n", text)
@@ -429,43 +397,40 @@ def normalize_markdown(content: str) -> str:
 
 
 def normalize_rst_to_markdown(content: str) -> str:
-    """Convert common reStructuredText structures to Markdown-like text.
-
-    This is a lightweight heuristic conversion intended for RAG ingestion.
-    It handles common headings, simple links, and literal blocks.
-    """
-    text = content.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    """Convert common RST structures to Markdown-like text."""
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.lstrip("\ufeff")
     text = rst_inline_to_markdown(text)
     lines = text.split("\n")
     out: list[str] = []
-    i = 0
+    index = 0
 
-    while i < len(lines):
-        line = lines[i]
-        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+    while index < len(lines):
+        line = lines[index]
+        next_line = lines[index + 1] if index + 1 < len(lines) else ""
 
         heading_level = rst_heading_level(line, next_line)
         if heading_level is not None:
             out.append("#" * heading_level + " " + line.strip())
-            i += 2
+            index += 2
             continue
 
         if line.rstrip().endswith("::"):
             prefix = line.rstrip()[:-2].rstrip()
             if prefix:
                 out.append(prefix)
-            code_block, consumed = consume_rst_literal_block(lines, i + 1)
+            code_block, consumed = consume_rst_literal_block(lines, index + 1)
             if code_block:
                 out.append("")
                 out.append("```text")
                 out.extend(code_block)
                 out.append("```")
                 out.append("")
-                i = i + 1 + consumed
+                index += 1 + consumed
                 continue
 
         out.append(line)
-        i += 1
+        index += 1
 
     normalized = "\n".join(out)
     normalized = re.sub(r"[ \t]+\n", "\n", normalized)
@@ -480,14 +445,11 @@ def rst_heading_level(line: str, next_line: str) -> int | None:
 
     if not stripped or not underline:
         return None
-
     if len(underline) < len(stripped):
         return None
-
-    if not re.fullmatch(r"(=+|-+|~+|\^+|\"+|\*+|\++|#+)", underline):
+    if not re.fullmatch(r'(=+|-+|~+|\^+|"+|\*+|\++|#+)', underline):
         return None
 
-    char = underline[0]
     levels = {
         "=": 1,
         "-": 2,
@@ -498,31 +460,35 @@ def rst_heading_level(line: str, next_line: str) -> int | None:
         "+": 5,
         "#": 5,
     }
-    return levels.get(char, 5)
+    return levels.get(underline[0], 5)
 
 
-def consume_rst_literal_block(lines: list[str], start_index: int) -> tuple[list[str], int]:
-    """Consume an indented literal block after a ``::`` marker."""
+def consume_rst_literal_block(
+    lines: list[str],
+    start_index: int,
+) -> tuple[list[str], int]:
+    """Consume an indented literal block after ``::``."""
     block: list[str] = []
     consumed = 0
 
-    # Skip blank lines immediately after the marker.
-    while start_index + consumed < len(lines) and lines[start_index + consumed].strip() == "":
+    while start_index + consumed < len(lines):
+        if lines[start_index + consumed].strip() != "":
+            break
         consumed += 1
 
     indent: int | None = None
-    idx = start_index + consumed
+    index = start_index + consumed
 
-    while idx < len(lines):
-        line = lines[idx]
+    while index < len(lines):
+        line = lines[index]
         if line.strip() == "":
             if indent is None:
                 consumed += 1
-                idx += 1
+                index += 1
                 continue
             block.append("")
             consumed += 1
-            idx += 1
+            index += 1
             continue
 
         current_indent = len(line) - len(line.lstrip(" "))
@@ -536,13 +502,13 @@ def consume_rst_literal_block(lines: list[str], start_index: int) -> tuple[list[
 
         block.append(line[indent:])
         consumed += 1
-        idx += 1
+        index += 1
 
     return block, consumed
 
 
 def rst_inline_to_markdown(text: str) -> str:
-    """Convert common inline RST markup to Markdown-like inline text."""
+    """Convert common inline RST markup to Markdown-like text."""
     text = re.sub(r":\w+:`([^`]+)`", r"\1", text)
     text = re.sub(r"`([^`<]+?)\s*<([^>]+)>`_", r"[\1](\2)", text)
     text = re.sub(r"`([^`]+)`_", r"\1", text)
@@ -557,10 +523,11 @@ def download_file(
     path: str,
     destination: Path,
 ) -> Path:
-    """Download a file from GitHub raw content."""
-    from urllib.parse import quote
-
-    url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{quote(path, safe='/')}"
+    """Download one file from GitHub raw content."""
+    url = (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/"
+        f"{quote(path, safe='/')}"
+    )
     out_path = destination / path
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -583,7 +550,7 @@ def write_normalized_document(
     raw_text: str,
     normalized_destination: Path,
 ) -> Path:
-    """Write a normalized document with a unified extension and metadata."""
+    """Write a normalized document."""
     normalized_text = normalize_document(
         content=raw_text,
         source_path=path,
@@ -605,47 +572,152 @@ def delete_local_file(destination: Path, path: str) -> bool:
     return False
 
 
+def _repo_context(repo_cfg: RepoConfig) -> RepoContext:
+    """Resolve repository settings."""
+    owner, repo_name = parse_repo(repo_cfg.name)
+    destination = repo_cfg.destination
+    normalized_destination = repo_cfg.normalized_destination
+    if normalized_destination is None:
+        normalized_destination = destination / "normalized"
+    return RepoContext(
+        owner=owner,
+        repo=repo_name,
+        repo_name=repo_cfg.name,
+        destination=destination,
+        normalized_destination=normalized_destination,
+    )
+
+
+def _tree_diff(
+    old_tree: dict[str, str],
+    new_tree: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """Return changed and deleted tracked file paths."""
+    old_paths = set(old_tree)
+    new_paths = set(new_tree)
+    added_or_changed = sorted(
+        path
+        for path in new_paths
+        if path not in old_tree or old_tree[path] != new_tree[path]
+    )
+    deleted = sorted(old_paths - new_paths)
+    return added_or_changed, deleted
+
+
+def _sync_downloads(
+    context: RepoContext,
+    commit_sha: str,
+    paths: list[str],
+    normalize_for_rag: bool,
+    logger: logging.Logger,
+) -> tuple[list[str], list[str]]:
+    """Download changed files and normalize them."""
+    downloaded_files: list[str] = []
+    normalized_files: list[str] = []
+
+    for path in paths:
+        raw_output = download_file(
+            context.owner,
+            context.repo,
+            commit_sha,
+            path,
+            context.destination,
+        )
+        downloaded_files.append(path)
+        logger.debug(
+            "Downloaded %s:%s -> %s",
+            context.repo_name,
+            path,
+            raw_output,
+        )
+
+        if normalize_for_rag:
+            raw_text = raw_output.read_text(encoding="utf-8", errors="replace")
+            normalized_output = write_normalized_document(
+                repo_name=context.repo_name,
+                commit_sha=commit_sha,
+                path=path,
+                raw_text=raw_text,
+                normalized_destination=context.normalized_destination,
+            )
+            relative_path = normalized_output.relative_to(
+                context.normalized_destination
+            )
+            normalized_files.append(str(relative_path))
+            logger.debug(
+                "Normalized %s:%s -> %s",
+                context.repo_name,
+                path,
+                normalized_output,
+            )
+
+    return downloaded_files, normalized_files
+
+
+def _sync_deletions(
+    context: RepoContext,
+    paths: list[str],
+    normalize_for_rag: bool,
+    logger: logging.Logger,
+) -> list[str]:
+    """Delete removed files from raw and normalized destinations."""
+    deleted_files: list[str] = []
+
+    for path in paths:
+        if delete_local_file(context.destination, path):
+            deleted_files.append(path)
+            logger.debug("Deleted local file %s:%s", context.repo_name, path)
+
+        if normalize_for_rag:
+            normalized_path = (
+                context.normalized_destination / path
+            ).with_suffix(".md")
+            if normalized_path.exists() and normalized_path.is_file():
+                normalized_path.unlink()
+                logger.debug(
+                    "Deleted normalized file %s:%s",
+                    context.repo_name,
+                    normalized_path,
+                )
+
+    return deleted_files
+
+
 def sync_one_repo(
     repo_cfg: RepoConfig,
     token: str | None = None,
     logger: logging.Logger | None = None,
 ) -> SyncResult:
-    """Synchronize one repository according to its config.
-
-    Args:
-        repo_cfg: Repository configuration.
-        token: Optional GitHub token.
-        logger: Optional logger instance.
-
-    Returns:
-        A SyncResult describing the run.
-    """
+    """Synchronize one repository."""
     logger = logger or logging.getLogger(__name__)
-    owner, repo_name = parse_repo(repo_cfg.name)
-    destination = repo_cfg.destination
-    destination.mkdir(parents=True, exist_ok=True)
-
-    normalized_destination = repo_cfg.normalized_destination
-    if normalized_destination is None:
-        normalized_destination = destination / "normalized"
+    context = _repo_context(repo_cfg)
+    context.destination.mkdir(parents=True, exist_ok=True)
     if repo_cfg.normalize_for_rag:
-        normalized_destination.mkdir(parents=True, exist_ok=True)
+        context.normalized_destination.mkdir(parents=True, exist_ok=True)
 
-    state = load_state(destination)
+    state = load_state(context.destination)
     latest_sha, latest_commit_time = get_latest_commit(
-        owner=owner,
-        repo=repo_name,
+        owner=context.owner,
+        repo=context.repo,
         token=token,
         branch=repo_cfg.branch,
     )
 
-    logger.info("Repo %s latest SHA=%s time=%s", repo_cfg.name, latest_sha, latest_commit_time.isoformat())
+    logger.info(
+        "Repo %s latest SHA=%s time=%s",
+        context.repo_name,
+        latest_sha,
+        latest_commit_time.isoformat(),
+    )
 
     if not was_recent(latest_commit_time, repo_cfg.within_hours):
-        reason = f"Repository was not updated within the last {repo_cfg.within_hours} hours."
-        logger.info("Skipping %s: %s", repo_cfg.name, reason)
+        reason = (
+            "Repository was not updated within the last "
+            f"{repo_cfg.within_hours} hours."
+        )
+        logger.info("Skipping %s: %s", context.repo_name, reason)
         return SyncResult(
-            repo=repo_cfg.name,
+            repo=context.repo_name,
             latest_commit_sha=latest_sha,
             latest_commit_time=latest_commit_time,
             downloaded_files=[],
@@ -657,9 +729,9 @@ def sync_one_repo(
 
     if state.last_commit_sha == latest_sha:
         reason = "Latest commit SHA matches cached state."
-        logger.info("Skipping %s: %s", repo_cfg.name, reason)
+        logger.info("Skipping %s: %s", context.repo_name, reason)
         return SyncResult(
-            repo=repo_cfg.name,
+            repo=context.repo_name,
             latest_commit_sha=latest_sha,
             latest_commit_time=latest_commit_time,
             downloaded_files=[],
@@ -671,85 +743,68 @@ def sync_one_repo(
 
     if state.last_commit_sha is None:
         old_tree: dict[str, str] = {}
-        logger.info("No prior state for %s; performing initial sync.", repo_cfg.name)
+        logger.info(
+            "No prior state for %s; performing initial sync.",
+            context.repo_name,
+        )
     else:
         old_tree = select_tracked_files(
-            get_recursive_tree(owner, repo_name, state.last_commit_sha, token),
+            get_recursive_tree(
+                context.owner,
+                context.repo,
+                state.last_commit_sha,
+                token,
+            ),
             repo_cfg.include_patterns,
             repo_cfg.exclude_patterns,
         )
 
     new_tree = select_tracked_files(
-        get_recursive_tree(owner, repo_name, latest_sha, token),
+        get_recursive_tree(context.owner, context.repo, latest_sha, token),
         repo_cfg.include_patterns,
         repo_cfg.exclude_patterns,
     )
 
-    old_paths = set(old_tree)
-    new_paths = set(new_tree)
-
-    added_or_changed = sorted(
-        path for path in new_paths if path not in old_tree or old_tree[path] != new_tree[path]
-    )
-    deleted = sorted(old_paths - new_paths)
-
+    added_or_changed, deleted = _tree_diff(old_tree, new_tree)
     logger.info(
         "Repo %s: %d tracked files, %d changed/added, %d deleted",
-        repo_cfg.name,
-        len(new_paths),
+        context.repo_name,
+        len(new_tree),
         len(added_or_changed),
         len(deleted),
     )
 
-    downloaded_files: list[str] = []
-    deleted_files: list[str] = []
-    normalized_files: list[str] = []
-
-    for path in added_or_changed:
-        raw_output = download_file(owner, repo_name, latest_sha, path, destination)
-        downloaded_files.append(path)
-        logger.debug("Downloaded %s:%s -> %s", repo_cfg.name, path, raw_output)
-
-        if repo_cfg.normalize_for_rag:
-            raw_text = raw_output.read_text(encoding="utf-8", errors="replace")
-            normalized_output = write_normalized_document(
-                repo_name=repo_cfg.name,
-                commit_sha=latest_sha,
-                path=path,
-                raw_text=raw_text,
-                normalized_destination=normalized_destination,
-            )
-            normalized_files.append(str(normalized_output.relative_to(normalized_destination)))
-            logger.debug("Normalized %s:%s -> %s", repo_cfg.name, path, normalized_output)
-
-    for path in deleted:
-        if delete_local_file(destination, path):
-            deleted_files.append(path)
-            logger.debug("Deleted local file %s:%s", repo_cfg.name, path)
-
-        if repo_cfg.normalize_for_rag:
-            normalized_path = (normalized_destination / path).with_suffix(".md")
-            if normalized_path.exists() and normalized_path.is_file():
-                normalized_path.unlink()
-                logger.debug("Deleted normalized file %s:%s", repo_cfg.name, normalized_path)
+    downloaded_files, normalized_files = _sync_downloads(
+        context=context,
+        commit_sha=latest_sha,
+        paths=added_or_changed,
+        normalize_for_rag=repo_cfg.normalize_for_rag,
+        logger=logger,
+    )
+    deleted_files = _sync_deletions(
+        context=context,
+        paths=deleted,
+        normalize_for_rag=repo_cfg.normalize_for_rag,
+        logger=logger,
+    )
 
     new_state = SyncState(
         last_commit_sha=latest_sha,
         last_sync_time=datetime.now(timezone.utc).isoformat(),
         files_downloaded=len(downloaded_files),
     )
-    save_state(destination, new_state)
+    save_state(context.destination, new_state)
 
     logger.info(
         "Finished %s: downloaded=%d normalized=%d deleted=%d cache updated",
-        repo_cfg.name,
+        context.repo_name,
         len(downloaded_files),
         len(normalized_files),
         len(deleted_files),
     )
 
     return SyncResult(
-        repo=repo_cfg.name,
+        repo=context.repo_name,
         latest_commit_sha=latest_sha,
         latest_commit_time=latest_commit_time,
         downloaded_files=downloaded_files,
@@ -764,15 +819,7 @@ def sync_from_config(
     config: AppConfig,
     token: str | None = None,
 ) -> list[SyncResult]:
-    """Synchronize all repositories in an application config.
-
-    Args:
-        config: Application configuration.
-        token: Optional GitHub token.
-
-    Returns:
-        A list of per-repository sync results.
-    """
+    """Synchronize all repositories in a config."""
     configure_logging(config.logging)
     logger = logging.getLogger(__name__)
     results: list[SyncResult] = []
@@ -784,7 +831,7 @@ def sync_from_config(
     for repo_cfg in config.repos:
         try:
             results.append(sync_one_repo(repo_cfg, token=token, logger=logger))
-        except Exception:
+        except (OSError, RuntimeError, requests.RequestException, ValueError):
             logger.exception("Failed to sync repository %s", repo_cfg.name)
             raise
 

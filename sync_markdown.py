@@ -7,22 +7,26 @@ import logging
 import os
 import sys
 
+import requests
+
 from github_markdown_sync import load_yaml_config, sync_from_config
 
 
 def main() -> int:
-    """Run the CLI entry point.
-
-    Returns:
-        Process exit code.
-    """
+    """Run the CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Synchronize Markdown and RST documentation from GitHub repositories."
+        description=(
+            "Synchronize Markdown and RST documentation from GitHub "
+            "repositories."
+        ),
     )
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to a YAML config file describing repositories to monitor.",
+        help=(
+            "Path to a YAML config file describing repositories to "
+            "monitor."
+        ),
     )
     parser.add_argument(
         "--token",
@@ -32,7 +36,10 @@ def main() -> int:
     parser.add_argument(
         "--log-level",
         default=None,
-        help="Override the log level from the YAML config, for example INFO or DEBUG.",
+        help=(
+            "Override the log level from the YAML config, for example "
+            "INFO or DEBUG."
+        ),
     )
     args = parser.parse_args()
 
@@ -53,20 +60,26 @@ def main() -> int:
             )
 
         results = sync_from_config(config, token=args.token)
-
         for result in results:
             if result.skipped:
                 print(f"{result.repo}: skipped ({result.reason})")
-            else:
-                print(
-                    f"{result.repo}: downloaded={len(result.downloaded_files)} "
-                    f"normalized={len(result.normalized_files)} "
-                    f"deleted={len(result.deleted_files)} sha={result.latest_commit_sha}"
-                )
+                continue
+
+            print(
+                f"{result.repo}: downloaded={len(result.downloaded_files)} "
+                f"normalized={len(result.normalized_files)} "
+                f"deleted={len(result.deleted_files)} "
+                f"sha={result.latest_commit_sha}"
+            )
 
         return 0
 
-    except Exception as exc:
+    except (
+        OSError,
+        ValueError,
+        RuntimeError,
+        requests.RequestException,
+    ) as exc:
         logging.getLogger(__name__).exception("Sync failed")
         print(f"Error: {exc}", file=sys.stderr)
         return 1
