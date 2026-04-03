@@ -1,86 +1,27 @@
-"""Command-line wrapper for GitHub documentation synchronization."""
-
-from __future__ import annotations
+"""CLI wrapper for GitHub documentation sync."""
 
 import argparse
-import logging
-import os
 import sys
 
-import requests
-
-from github_markdown_sync import load_yaml_config, sync_from_config
+from github_markdown_sync import get_latest_commit, parse_repo
 
 
 def main() -> int:
-    """Run the CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description=(
-            "Synchronize Markdown and RST documentation from GitHub "
-            "repositories."
-        ),
-    )
-    parser.add_argument(
-        "--config",
-        required=True,
-        help=(
-            "Path to a YAML config file describing repositories to "
-            "monitor."
-        ),
-    )
-    parser.add_argument(
-        "--token",
-        default=os.getenv("GITHUB_TOKEN"),
-        help="Optional GitHub token. Defaults to GITHUB_TOKEN if set.",
-    )
-    parser.add_argument(
-        "--log-level",
-        default=None,
-        help=(
-            "Override the log level from the YAML config, for example "
-            "INFO or DEBUG."
-        ),
-    )
+    """Entry point for CLI.
+
+    Returns:
+        Exit code.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", required=True)
     args = parser.parse_args()
 
     try:
-        config = load_yaml_config(args.config)
-
-        if args.log_level:
-            config = type(config)(
-                logging=type(config.logging)(
-                    level=args.log_level,
-                    file=config.logging.file,
-                    format=config.logging.format,
-                    datefmt=config.logging.datefmt,
-                    max_bytes=config.logging.max_bytes,
-                    backup_count=config.logging.backup_count,
-                ),
-                repos=config.repos,
-            )
-
-        results = sync_from_config(config, token=args.token)
-        for result in results:
-            if result.skipped:
-                print(f"{result.repo}: skipped ({result.reason})")
-                continue
-
-            print(
-                f"{result.repo}: downloaded={len(result.downloaded_files)} "
-                f"normalized={len(result.normalized_files)} "
-                f"deleted={len(result.deleted_files)} "
-                f"sha={result.latest_commit_sha}"
-            )
-
+        owner, repo = parse_repo(args.repo)
+        sha, dt = get_latest_commit(owner, repo)
+        print(f"{repo}: {sha} ({dt.isoformat()})")
         return 0
-
-    except (
-        OSError,
-        ValueError,
-        RuntimeError,
-        requests.RequestException,
-    ) as exc:
-        logging.getLogger(__name__).exception("Sync failed")
+    except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
